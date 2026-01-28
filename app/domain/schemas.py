@@ -50,3 +50,9 @@ class ActionResult(BaseModel):
     status: str = Field(..., description="Outcome: executed, skipped, noop, failed")
     artifact_path: Optional[str] = Field(None, description="Where a draft artifact was stored (if any)")
     reason: str = Field(..., description="Human-readable explanation of what happened")
+
+class SlackIngestRequest(BaseModel):
+    text: str
+    user: Optional[str] = None
+    channel: Optional[str] = None
+    ts: Optional[str] = None

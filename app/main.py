@@ -5,7 +5,7 @@ from fastapi import FastAPI, Header, HTTPException
 
 from app.core.idempotency import get_event, set_event
 from app.core.logging import get_logger, log_event
-from app.domain.schemas import IngestRequest, Event, IngestResponse
+from app.domain.schemas import IngestRequest, IngestResponse, SlackIngestRequest, Event
 from app.services.router import route_event
 from app.services.actuator import execute_decision
 
@@ -13,16 +13,16 @@ app = FastAPI(title="AI Control Plane")
 logger = get_logger()
 
 
-@app.get("/health")
-def health_check():
-    return {"status": "ok"}
-
-
-@app.post("/ingest/api", response_model=IngestResponse)
-def ingest_api(
-    req: IngestRequest,
-    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
-) -> IngestResponse:
+def _process_ingest(ingest_req: IngestRequest, idempotency_key: str | None) -> IngestResponse:
+    """
+    Shared ingest pipeline for all adapters:
+      - enforce idempotency key
+      - reuse or create Event
+      - Decide (router)
+      - Act v0 (safe execution)
+      - log everything
+      - return {event, decision}
+    """
     # Gate 1: Idempotency-Key is required
     if not idempotency_key:
         log_event(
@@ -30,13 +30,13 @@ def ingest_api(
             event_name="ingest_rejected",
             fields={
                 "reason": "missing_idempotency_key",
-                "event_type": req.event_type,
-                "source": req.source,
+                "event_type": ingest_req.event_type,
+                "source": ingest_req.source,
             },
         )
         raise HTTPException(status_code=400, detail="Missing Idempotency-Key header")
 
-    # Gate 2: Reuse existing Event if this key was already processed
+    # Gate 2: Idempotency reuse
     existing_event = get_event(idempotency_key)
     if existing_event:
         log_event(
@@ -91,19 +91,18 @@ def ingest_api(
                     "error": str(e),
                 },
             )
-            # We do not fail the whole request in Tier-1 v0; we stay observable and safe.
 
         return IngestResponse(event=existing_event, decision=decision)
 
-    # New Event
+    # Create new Event
     event = Event(
         event_id=str(uuid.uuid4()),
-        event_type=req.event_type,
-        source=req.source,
+        event_type=ingest_req.event_type,
+        source=ingest_req.source,
         timestamp=datetime.utcnow(),
-        actor=req.actor,
-        payload=req.payload,
-        metadata=req.metadata,
+        actor=ingest_req.actor,
+        payload=ingest_req.payload,
+        metadata=ingest_req.metadata,
     )
 
     log_event(
@@ -116,6 +115,9 @@ def ingest_api(
             "source": event.source,
         },
     )
+
+    # Persist Event for idempotency
+    set_event(idempotency_key, event)
 
     # Decide
     decision = route_event(event)
@@ -130,9 +132,6 @@ def ingest_api(
             "reason": decision.reason,
         },
     )
-
-    # Persist Event for idempotency
-    set_event(idempotency_key, event)
 
     # Act (safe execution)
     try:
@@ -161,6 +160,40 @@ def ingest_api(
                 "error": str(e),
             },
         )
-        # We do not fail the whole request in Tier-1 v0; we stay observable and safe.
 
     return IngestResponse(event=event, decision=decision)
+
+
+@app.get("/health")
+def health_check():
+    return {"status": "ok"}
+
+
+@app.post("/ingest/api", response_model=IngestResponse)
+def ingest_api(
+    req: IngestRequest,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> IngestResponse:
+    return _process_ingest(req, idempotency_key)
+
+
+@app.post("/ingest/slack", response_model=IngestResponse)
+def ingest_slack(
+    slack: SlackIngestRequest,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> IngestResponse:
+    """
+    Slack adapter: translate Slack-shaped payload into your canonical IngestRequest,
+    then run the exact same pipeline.
+    """
+    ingest_req = IngestRequest(
+        event_type="support_request",
+        source="slack",
+        actor=slack.user,
+        payload={"text": slack.text},
+        metadata={
+            "channel": slack.channel,
+            "ts": slack.ts,
+        },
+    )
+    return _process_ingest(ingest_req, idempotency_key)

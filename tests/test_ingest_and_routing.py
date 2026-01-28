@@ -62,3 +62,38 @@ def test_idempotency_same_key_returns_same_event_id():
     event_id_2 = r2.json()["event"]["event_id"]
 
     assert event_id_1 == event_id_2
+
+
+def test_slack_adapter_translates_and_routes_request_more_info():
+    """
+    Slack adapter should:
+    - accept Slack-shaped payload
+    - translate it into canonical IngestRequest/Event
+    - run the same pipeline
+    - because urgency is missing, route to REQUEST_MORE_INFO
+    """
+    slack_payload = {
+        "text": "VPN is down",
+        "user": "U123",
+        "channel": "C999",
+        "ts": "1700000000.0001",
+    }
+
+    headers = {"Idempotency-Key": "slack-test-1"}
+
+    response = client.post("/ingest/slack", json=slack_payload, headers=headers)
+    assert response.status_code == 200
+
+    body = response.json()
+    event = body["event"]
+    decision = body["decision"]
+
+    # Adapter translation assertions
+    assert event["source"] == "slack"
+    assert event["actor"] == "U123"
+    assert event["payload"]["text"] == "VPN is down"
+    assert event["metadata"]["channel"] == "C999"
+    assert event["metadata"]["ts"] == "1700000000.0001"
+
+    # Routing assertion (urgency missing)
+    assert decision["route"] == "REQUEST_MORE_INFO"
